@@ -9,17 +9,23 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cv2
 import depthai as dai
+from pathlib import Path
+import json
+import blobconverter
 
 # from cam_lidar_fusion.cone_detection import detect_cones
 
 
 class FusionNode(Node):
     def __init__(self):
+        self.yolo_config = "model/obstacle_v2.json"
+        self.yolo_model = "model/obstacle_v2_openvino_2022.1_6shave.blob"
+
+        self.camera_type = "OAK_LR"  # WEBCAM, OAK_WIDE, OAK_LR
+
         self.R = np.array([[0, -1, 0], [0, 0, -1], [1, 0, 0]])  # Rotation from lidar to camera
         # self.T = np.array([0, 0.2, 0])  # lidar frame position seen from the camera's frame
         self.T = np.array([0, 0.1, 0])  # oak lr test
-
-        self.camera_type = "OAK_LR"  # WEBCAM, OAK_WIDE, OAK_LR
 
         if self.camera_type == "WEBCAM":
             # webcam #########################################################################################################
@@ -79,6 +85,7 @@ class FusionNode(Node):
 
     def lidar_subs_callback(self, msg):
         frame = None
+        detections = []
         max_dist_thresh = 10  # the max distance used for color coding in visualization window.
         # print("Received: ", msg.fields)  # Print the received message
         lidar_points = np.array(list(read_points(msg, skip_nans=True))).T  # 4xn matrix, (x,y,z,i)
@@ -89,27 +96,24 @@ class FusionNode(Node):
         self.depth_matrix = points_to_img(filtered_x, filtered_y, filtered_p, self.img_size)
 
         # Visualization ####################################################################################
-        # Choose between webcam and oak-d cam, remember to comment the VideoCapture in the __init__
-        # Webcam #########################
-        # ret, frame = self.cap.read()
-        # if not ret:
-        #     print("Cannot receive frame")
-        # # cv2.imshow('frame', frame)
-        # ################################
-        
         # Oak-d cam (ros subscriber) ######################
         # if self.frame is not None:
         #     frame = self.frame.copy()
-        # ################################
+        # #################################################
         
         if self.camera_type == "WEBCAM":
             ret, frame = self.cap.read()
         else:
-            oak_q = self.device.getOutputQueue(name='rgb', maxSize=1, blocking=False)
-            in_q = oak_q.tryGet()
-            if in_q is not None:
-                frame = in_q.getCvFrame()
+            q_rgb = self.device.getOutputQueue(name='rgb', maxSize=1, blocking=False)
+            q_detection = self.device.getOutputQueue(name="nn", maxSize=4, blocking=False)
+            in_rgb = q_rgb.tryGet()
+            in_detection = q_detection.get()
+
+            if in_rgb is not None:
+                frame = in_rgb.getCvFrame()
                 # print("got frame")
+            if in_detection is not None:
+                detections = in_detection.detections
         
         if frame is not None:
             cone_detection_boxes = detect_cones(frame, self.cone_hsv_lb, self.cone_hsv_ub)
@@ -149,18 +153,92 @@ class FusionNode(Node):
         # ax.plot3D(X, Y, self.depth_matrix)
     
     def get_oak_pipeline(self):
+        # parse config
+        configPath = Path(self.yolo_config)
+        if not configPath.exists():
+            raise ValueError("Path {} does not exist!".format(configPath))
+
+        with configPath.open() as f:
+            config = json.load(f)
+        nnConfig = config.get("nn_config", {})
+
+        # parse input shape
+        if "input_size" in nnConfig:
+            W, H = tuple(map(int, nnConfig.get("input_size").split('x')))
+
+        # extract metadata
+        metadata = nnConfig.get("NN_specific_metadata", {})
+        classes = metadata.get("classes", {})
+        coordinates = metadata.get("coordinates", {})
+        anchors = metadata.get("anchors", {})
+        anchorMasks = metadata.get("anchor_masks", {})
+        iouThreshold = metadata.get("iou_threshold", {})
+        confidenceThreshold = metadata.get("confidence_threshold", {})
+
+        print(metadata)
+
+        # parse labels
+        nnMappings = config.get("mappings", {})
+        labels = nnMappings.get("labels", {})
+
+        # get model path
+        nnPath = self.yolo_model
+        if not Path(nnPath).exists():
+            print("No blob found at {}. Looking into DepthAI model zoo.".format(nnPath))
+            nnPath = str(blobconverter.from_zoo(self.yolo_model, shaves = 6, zoo_type = "depthai", use_cache=True))
+        # sync outputs
+        syncNN = True
+
+        # Create pipeline
         pipeline = dai.Pipeline()
-        cam_rgb = pipeline.create(dai.node.ColorCamera)
-        # cam_rgb.setPreviewSize(1448, 568)
-        cam_rgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
-        if self.camera_type == "OAK_LR":
-            cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1200_P)
-        elif self.camera_type == "OAK_WIDE":
-            cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_800_P)
-        cam_rgb.setInterleaved(False)
-        xout_rgb = pipeline.create(dai.node.XLinkOut)
-        xout_rgb.setStreamName("rgb")
-        cam_rgb.video.link(xout_rgb.input)
+
+        # Define sources and outputs
+        camRgb = pipeline.create(dai.node.ColorCamera)
+        detectionNetwork = pipeline.create(dai.node.YoloDetectionNetwork)
+        xoutRgb = pipeline.create(dai.node.XLinkOut)
+        nnOut = pipeline.create(dai.node.XLinkOut)
+
+        xoutRgb.setStreamName("rgb")
+        nnOut.setStreamName("nn")
+
+        # Properties
+        camRgb.setPreviewSize(W, H)
+        camRgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
+
+        camRgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+        camRgb.setInterleaved(False)
+        camRgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+        camRgb.setFps(40)
+
+        # Network specific settings
+        detectionNetwork.setConfidenceThreshold(confidenceThreshold)
+        detectionNetwork.setNumClasses(classes)
+        detectionNetwork.setCoordinateSize(coordinates)
+        detectionNetwork.setAnchors(anchors)
+        detectionNetwork.setAnchorMasks(anchorMasks)
+        detectionNetwork.setIouThreshold(iouThreshold)
+        detectionNetwork.setBlobPath(nnPath)
+        detectionNetwork.setNumInferenceThreads(2)
+        detectionNetwork.input.setBlocking(False)
+
+        # Linking
+        camRgb.preview.link(detectionNetwork.input)
+        # camRgb.video.link(xoutRgb.input)
+        detectionNetwork.passthrough.link(xoutRgb.input)
+        detectionNetwork.out.link(nnOut.input)
+
+        # pipeline = dai.Pipeline()
+        # cam_rgb = pipeline.create(dai.node.ColorCamera)
+        # # cam_rgb.setPreviewSize(1448, 568)
+        # cam_rgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
+        # if self.camera_type == "OAK_LR":
+        #     cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1200_P)
+        # elif self.camera_type == "OAK_WIDE":
+        #     cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_800_P)
+        # cam_rgb.setInterleaved(False)
+        # xout_rgb = pipeline.create(dai.node.XLinkOut)
+        # xout_rgb.setStreamName("rgb")
+        # cam_rgb.video.link(xout_rgb.input)
 
         return pipeline
 
