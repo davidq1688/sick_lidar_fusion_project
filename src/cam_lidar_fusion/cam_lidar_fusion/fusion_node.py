@@ -8,7 +8,7 @@ from rclpy.qos import qos_profile_sensor_data
 import numpy as np
 import matplotlib.pyplot as plt
 import cv2
-import depthai as dai
+# import depthai as dai
 from ultralytics import YOLO
 
 from ament_index_python import get_package_share_directory
@@ -24,13 +24,12 @@ class FusionNode(Node):
         self.T = np.array([0, 0.1, 0])  # oak lr test
 
         self.camera_type = "OAK_LR"  # WEBCAM, OAK_WIDE, OAK_LR
-        self.use_ROS_camera_topic = False  # use ROS subscriber to get camera images 
+        self.use_ROS_camera_topic = True  # use ROS subscriber to get camera images 
 
         yolo_model_path = os.path.join(get_package_share_directory("cam_lidar_fusion"), "model/obstacle_v2_320.pt")
 
-        #self.yolo_model = YOLO("model/obstacle_v2.pt")
         self.yolo_model = YOLO(yolo_model_path)
-        self.yolo_model.to(device='cuda')
+        # self.yolo_model.to(device='cuda')
 
         if self.camera_type == "WEBCAM":
             # webcam #########################################################################################################
@@ -45,13 +44,13 @@ class FusionNode(Node):
             self.K = np.array([[1007.03765, 0, 693.05655], [0, 1007.59267, 356.9163], [0, 0, 1]])  # K matrix from camera_calibration
             self.img_size = [720, 1280]  # Size of the img captured by the camera
             pipeline = self.get_oak_pipeline()
-            self.device = dai.Device(pipeline)
+            # self.device = dai.Device(pipeline)
         elif self.camera_type == "OAK_LR":
             # oak-d LR ########################################################################################################
             self.K = np.array([[1147.15312, 0., 936.61046], [0., 1133.707, 601.71022], [0, 0, 1]])
             self.img_size = (1200, 1920)
             pipeline = self.get_oak_pipeline()
-            self.device = dai.Device(pipeline)
+            # self.device = dai.Device(pipeline)
         else:
             print("camera type not supported")
             exit()
